@@ -179,6 +179,40 @@ server/index.mjs
 - Fly.io
 - 自有 VPS
 
+### www.laumy.tech 子路径部署
+
+当前生产部署路径：
+
+```text
+https://www.laumy.tech/tools/ai-hardware-estimator/
+```
+
+部署到服务器：
+
+```bash
+git clone git@github.com:mingyuan-liu/ai-hardware-estimator.git /srv/ai-hardware-estimator
+cd /srv/ai-hardware-estimator
+npm ci
+npm run build
+```
+
+服务由 systemd 管理：
+
+```bash
+sudo cp deploy/systemd/ai-hardware-estimator.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now ai-hardware-estimator.service
+```
+
+服务只监听本机：
+
+```text
+HOST=127.0.0.1
+PORT=8787
+```
+
+Nginx 通过 `/tools/ai-hardware-estimator/` 反向代理到本机 `8787` 端口。
+
 ## 精度和校准说明
 
 本工具用于早期硬件规格评估和方案评审，不是周期级仿真器。

@@ -695,8 +695,11 @@ function App() {
     setLoading(true);
     setLoadError("");
     try {
+      const apiUrl = `${import.meta.env.BASE_URL}api/model?source=${parsed.source}&modelId=${encodeURIComponent(
+        parsed.modelId
+      )}`;
       const response = await fetch(
-        `/api/model?source=${parsed.source}&modelId=${encodeURIComponent(parsed.modelId)}`
+        apiUrl
       );
       const payload = await response.json();
       if (!response.ok) throw new Error(payload.error || "模型元数据获取失败");
