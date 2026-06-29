@@ -209,6 +209,7 @@ sudo systemctl enable --now ai-hardware-estimator.service
 ```text
 HOST=127.0.0.1
 PORT=8787
+HUGGINGFACE_BASE_URL=https://hf-mirror.com
 ```
 
 Nginx 通过 `/tools/ai-hardware-estimator/` 反向代理到本机 `8787` 端口。

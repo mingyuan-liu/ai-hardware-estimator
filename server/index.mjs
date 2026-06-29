@@ -7,6 +7,7 @@ const __dirname = path.dirname(__filename);
 const app = express();
 const HOST = process.env.HOST || "127.0.0.1";
 const PORT = Number(process.env.PORT || 8787);
+const HUGGINGFACE_BASE_URL = (process.env.HUGGINGFACE_BASE_URL || "https://huggingface.co").replace(/\/$/, "");
 
 app.use(express.json({ limit: "1mb" }));
 
@@ -84,8 +85,8 @@ function normalizeModelScopeConfig(configText) {
 
 async function getHuggingFaceModel(modelId) {
   const encoded = encodeModelId(modelId);
-  const info = await fetchJson(`https://huggingface.co/api/models/${encoded}`);
-  const config = safeJsonParse(await fetchTextIfAvailable(`https://huggingface.co/${encoded}/raw/main/config.json`));
+  const info = await fetchJson(`${HUGGINGFACE_BASE_URL}/api/models/${encoded}`);
+  const config = safeJsonParse(await fetchTextIfAvailable(`${HUGGINGFACE_BASE_URL}/${encoded}/raw/main/config.json`));
   const files = (info.siblings || []).map(normalizeFile).filter((file) => file.name);
   const safetensorsStorage =
     info.safetensors?.total && Number(info.safetensors.total) > 0

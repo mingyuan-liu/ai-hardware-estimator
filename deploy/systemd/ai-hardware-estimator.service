@@ -9,6 +9,7 @@ WorkingDirectory=/srv/ai-hardware-estimator
 Environment=NODE_ENV=production
 Environment=HOST=127.0.0.1
 Environment=PORT=8787
+Environment=HUGGINGFACE_BASE_URL=https://hf-mirror.com
 ExecStart=/usr/bin/npm start
 Restart=on-failure
 RestartSec=3
