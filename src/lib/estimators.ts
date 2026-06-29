@@ -1,5 +1,5 @@
 import { getYoloScale, getYoloTask } from "./catalog";
-import { formatBytes, formatGib, formatNumber } from "./format";
+import { formatBytes, formatComputeOps, formatComputeTops, formatGib, formatNumber } from "./format";
 import { estimateParamsFromMetadata, getConfigNumber } from "./model";
 import type {
   BreakdownItem,
@@ -103,28 +103,75 @@ function estimateLlm(
     { label: "运行时余量", bytes: runtimeBytes, tone: "gray" }
   ];
   const totalMemory = totalBytes(memoryItems);
+  const prefillAttentionOps =
+    4 * workload.batchSize * layers * workload.promptTokens * workload.promptTokens * hidden;
+  const prefillOps = 2 * params * workload.batchSize * workload.promptTokens + prefillAttentionOps;
+  const targetPrefillSeconds = Math.max(0.001, workload.targetPrefillMs / 1000);
+  const prefillComputeTops = prefillOps / targetPrefillSeconds / 1e12;
+  const decodeSingleTokensPerSecond = workload.targetTokensPerSecond;
+  const decodeAggregateTokensPerSecond = decodeSingleTokensPerSecond * workload.batchSize;
   const effectiveWeightRead = weightBytes * Math.max(0.35, 1 / Math.sqrt(Math.max(1, workload.batchSize)));
-  const decodeBandwidth = workload.targetTokensPerSecond * effectiveWeightRead;
-  const computeTops = (2 * params * workload.targetTokensPerSecond) / 1e12;
+  const decodeWeightBandwidth = decodeAggregateTokensPerSecond * effectiveWeightRead;
+  const kvBytesPerToken =
+    workload.batchSize * layers * 2 * kvHeads * headDim * bytesPerPrecision(precision.kvCache);
+  const decodeKvBandwidth = decodeSingleTokensPerSecond * kvBytesPerToken * 2;
+  const decodeBandwidth = decodeWeightBandwidth + decodeKvBandwidth;
+  const computeTops = (2 * params * decodeAggregateTokensPerSecond) / 1e12;
   const storageBytes = Math.max(metadata?.storageBytes || 0, weightBytes) * 1.15;
 
   const formulas: FormulaRow[] = [
     {
       item: "权重容量",
+      level: "key",
       formula: "参数量 x 权重字节数",
       inputs: `${formatNumber(params / 1e9)}B params, ${precision.weights}`,
       result: formatGib(weightBytes)
     },
     {
       item: "KV cache",
+      level: "key",
       formula: "batch x context x layers x 2 x kv_heads x head_dim x KV字节数",
       inputs: `${workload.batchSize} x ${context} x ${layers} x 2 x ${kvHeads} x ${formatNumber(headDim)} x ${precision.kvCache}`,
       result: formatGib(kvBytes)
     },
     {
-      item: "Decode 带宽",
-      formula: "目标 tokens/s x 有效权重读取量",
-      inputs: `${workload.targetTokensPerSecond} tokens/s, batch ${workload.batchSize}`,
+      item: "Prefill 计算量",
+      formula: "2 x 参数量 x batch x prompt_tokens + attention二次项",
+      inputs: `${formatNumber(params / 1e9)}B params, batch ${workload.batchSize}, prompt ${workload.promptTokens}`,
+      result: formatComputeOps(prefillOps)
+    },
+    {
+      item: "Prefill 算力",
+      level: "key",
+      formula: "Prefill 计算量 / 目标 Prefill 时间",
+      inputs: `${formatComputeOps(prefillOps)}, ${workload.targetPrefillMs} ms`,
+      result: formatComputeTops(prefillComputeTops)
+    },
+    {
+      item: "Decode 聚合吞吐",
+      formula: "单路 TG token/s x batch",
+      inputs: `${decodeSingleTokensPerSecond} x ${workload.batchSize}`,
+      result: `${formatNumber(decodeAggregateTokensPerSecond)} tokens/s`
+    },
+    {
+      item: "Decode 权重带宽",
+      level: "key",
+      formula: "聚合 tokens/s x 有效权重读取量",
+      inputs: `${formatNumber(decodeAggregateTokensPerSecond)} tokens/s, batch ${workload.batchSize}`,
+      result: `${formatNumber(decodeWeightBandwidth / GB)} GB/s`
+    },
+    {
+      item: "Decode KV 带宽",
+      level: "key",
+      formula: "单路 TG token/s x batch x layers x 2 x kv_heads x head_dim x KV字节数 x 读写系数",
+      inputs: `${decodeSingleTokensPerSecond} tokens/s, batch ${workload.batchSize}, ${precision.kvCache}`,
+      result: `${formatNumber(decodeKvBandwidth / GB)} GB/s`
+    },
+    {
+      item: "Decode 总带宽",
+      level: "key",
+      formula: "Decode 权重带宽 + Decode KV 带宽",
+      inputs: `${formatNumber(decodeWeightBandwidth / GB)} + ${formatNumber(decodeKvBandwidth / GB)}`,
       result: `${formatNumber(decodeBandwidth / GB)} GB/s`
     }
   ];
@@ -133,20 +180,31 @@ function estimateLlm(
     title: `${metadata?.name || "LLM"} 推理硬件需求`,
     kind: "llm",
     confidence: explicitParams && metadata?.config ? "medium" : "low",
-    summary: `典型配置需要约 ${formatNumber(gb(totalMemory))} GB 内存，decode 侧约 ${formatNumber(
+    summary: `典型配置需要约 ${formatNumber(gb(totalMemory))} GB 内存；Prefill 在 ${formatNumber(
+      workload.targetPrefillMs
+    )} ms 目标下约需 ${formatComputeTops(prefillComputeTops)}，Decode 总带宽约 ${formatNumber(
       decodeBandwidth / GB
-    )} GB/s 读带宽。`,
+    )} GB/s。`,
     metrics: [
       metric("总内存容量", "GB", gb(totalMemory), "含运行时安全余量"),
       metric("模型存储容量", "GB", gb(storageBytes), "模型文件、tokenizer 与部署文件"),
-      metric("Decode 内存带宽", "GB/s", decodeBandwidth / GB, "低 batch 时通常是主要瓶颈"),
-      metric("Decode 算力", "TOPS", computeTops, "按 2 x 参数量 x tokens/s 粗估"),
-      metric("目标吞吐", "tokens/s", workload.targetTokensPerSecond, "聚合输出吞吐", 1, 1)
+      metric("Prefill 计算量", "Op", prefillOps, "batch x prompt tokens 的总操作量", 1, 1),
+      metric("目标 Prefill 时间", "ms", workload.targetPrefillMs, "用于估算首 token 前的算力需求", 1, 1),
+      metric("Prefill TOPS", "TOPS", prefillComputeTops, "按 batch x prompt tokens x 目标 TTFT 反推"),
+      metric("Decode 单路 TG", "tokens/s", decodeSingleTokensPerSecond, "单个请求的生成速度", 1, 1),
+      metric("Decode 聚合 TG", "tokens/s", decodeAggregateTokensPerSecond, "单路 TG x batch", 1, 1),
+      metric("Decode 权重带宽", "GB/s", decodeWeightBandwidth / GB, "聚合 TG x 有效权重读取量"),
+      metric("Decode KV 带宽", "GB/s", decodeKvBandwidth / GB, "KV cache 读写估算"),
+      metric("Decode 总带宽", "GB/s", decodeBandwidth / GB, "权重带宽 + KV 带宽"),
+      metric("Decode TOPS", "TOPS", computeTops, "按 2 x 参数量 x 聚合 TG 粗估")
     ],
     memoryBreakdown: memoryItems,
     formulas,
     assumptions: [
-      "推理框架会复用权重读取，batch 越大有效带宽压力越低。",
+      "Prefill 近似为 2 x 参数量 x prompt tokens，并加入 attention 的二次项；它主要用于估算 TTFT 算力压力。",
+      "Decode TG 在简单模式下表示单路 token/s，报告会按 batch 自动换算聚合 token/s。",
+      "Decode 总带宽拆为权重带宽和 KV 带宽；batch 越大，权重读取摊销越明显。",
+      "Decode KV 带宽按每个新 token 的 KV 读写近似估算，当前读写系数取 2。",
       "Prefill 临时内存按可控上界估算，不等同训练激活保存。",
       "保守值加入更高运行时和碎片余量，适合规格评审。"
     ],
@@ -180,9 +238,9 @@ function estimateAsr(
     title: `${metadata?.name || "ASR"} 推理硬件需求`,
     kind: "asr",
     confidence: explicitParams ? "medium" : "low",
-    summary: `典型配置需要约 ${formatNumber(gb(totalMemory))} GB 内存，目标实时率下约 ${formatNumber(
+    summary: `典型配置需要约 ${formatNumber(gb(totalMemory))} GB 内存，目标实时率下约 ${formatComputeTops(
       computeTops
-    )} TOPS。`,
+    )}。`,
     metrics: [
       metric("总内存容量", "GB", gb(totalMemory), "含音频缓存和运行时余量"),
       metric("模型存储容量", "GB", gb(Math.max(metadata?.storageBytes || 0, weightBytes) * 1.15), "公开仓库文件或权重反推"),
@@ -202,7 +260,7 @@ function estimateAsr(
         item: "实时算力",
         formula: "参数量 x 经验计算系数 x 并发流数 / RTF",
         inputs: `${formatNumber(params / 1e6)}M, streams ${workload.audioStreams}, RTF ${workload.targetRtf}`,
-        result: `${formatNumber(computeTops)} TOPS`
+        result: formatComputeTops(computeTops)
       }
     ],
     assumptions: [
@@ -241,9 +299,9 @@ function estimateTts(
     title: `${metadata?.name || "TTS"} 推理硬件需求`,
     kind: "tts",
     confidence: explicitParams ? "medium" : "low",
-    summary: `典型配置需要约 ${formatNumber(gb(totalMemory))} GB 内存，vocoder 侧实时生成约需 ${formatNumber(
+    summary: `典型配置需要约 ${formatNumber(gb(totalMemory))} GB 内存，vocoder 侧实时生成约需 ${formatComputeTops(
       computeTops
-    )} TOPS。`,
+    )}。`,
     metrics: [
       metric("总内存容量", "GB", gb(totalMemory), "acoustic model、vocoder 与缓存"),
       metric("模型存储容量", "GB", gb(Math.max(metadata?.storageBytes || 0, weightBytes) * 1.15), "部署包估算"),
@@ -263,7 +321,7 @@ function estimateTts(
         item: "生成算力",
         formula: "参数量 x vocoder经验系数 x 并发流数 / RTF",
         inputs: `${formatNumber(params / 1e6)}M, streams ${workload.audioStreams}, RTF ${workload.targetRtf}`,
-        result: `${formatNumber(computeTops)} TOPS`
+        result: formatComputeTops(computeTops)
       }
     ],
     assumptions: [
@@ -289,12 +347,12 @@ export function estimateYolo(config: YoloConfig): RequirementReport {
     config.batchSize * config.imageSize * config.imageSize * precisionBytes * task.activationFactor * task.flopsMultiplier;
   const candidateCount =
     config.task === "classify"
-      ? config.classes
+      ? 1
       : Math.round((config.imageSize / 8) ** 2 + (config.imageSize / 16) ** 2 + (config.imageSize / 32) ** 2);
   const outputValues = config.task === "classify" ? config.classes : config.classes + task.outputExtraValues;
   const outputBytes = config.batchSize * candidateCount * outputValues * precisionBytes;
   const postprocessBytes =
-    config.task === "classify" ? config.classes * 4 : config.batchSize * candidateCount * outputValues * 4 * 1.8;
+    config.task === "classify" ? config.batchSize * outputValues * 4 : config.batchSize * candidateCount * outputValues * 4 * 1.8;
   const runtimeBytes = Math.max(256 * MB, weightBytes * 0.18 + activationBytes * 0.45 + outputBytes);
   const memoryItems: BreakdownItem[] = [
     { label: "模型权重", bytes: weightBytes, tone: "green" },
@@ -312,52 +370,143 @@ export function estimateYolo(config: YoloConfig): RequirementReport {
     npu: 0.52
   }[config.backend];
   const requiredTops = rawTops / backendEfficiency;
-  const bandwidthBytes =
-    config.targetFps *
-    config.batchSize *
-    (weightBytes * 0.18 + activationBytes * 3.2 + outputBytes * 2.4 + postprocessBytes * 1.1);
   const storageBytes = weightBytes * 1.25;
+  const bandwidthPerBatchBytes = weightBytes * 0.18 + activationBytes * 3.2 + outputBytes * 2.4 + postprocessBytes * 1.1;
+  const bandwidthBytes = config.targetFps * bandwidthPerBatchBytes;
 
   return {
     title: `${scale.label} ${task.label} 推理硬件需求`,
     kind: "yolo",
     confidence: "medium",
-    summary: `在 ${config.imageSize}x${config.imageSize}、${config.targetFps} FPS 下，典型需要约 ${formatNumber(
+    summary: `在 ${config.imageSize}x${config.imageSize}、单路 ${config.targetFps} FPS、batch ${config.batchSize} 下，典型需要约 ${formatNumber(
       gb(totalMemory)
-    )} GB 运行内存和 ${formatNumber(requiredTops)} TOPS。`,
+    )} GB 运行内存和 ${formatComputeTops(requiredTops)}。`,
     metrics: [
       metric("总内存容量", "GB", gb(totalMemory), "含特征图、输出和后处理工作区"),
       metric("模型存储容量", "GB", gb(storageBytes), "权重与部署文件"),
       metric("主网络算力", "TOPS", requiredTops, `按 ${config.backend} 有效利用率估算`),
-      metric("DDR/显存带宽", "GB/s", bandwidthBytes / GB, "含特征图和后处理访问"),
-      metric("目标帧率", "FPS", config.targetFps, "单路或聚合帧率", 1, 1),
+      metric("DDR/显存带宽", "GB/s", bandwidthBytes / GB, "单 batch 访问量 x 单路 FPS"),
+      metric("单路帧率", "FPS", config.targetFps, "每路输入流目标帧率；batch 表示并行路数", 1, 1),
       metric("后处理工作区", "MB", mb(postprocessBytes), task.postprocessLabel)
     ],
     memoryBreakdown: memoryItems,
     formulas: [
       {
+        item: "参数量",
+        formula: "基准参数量 x 任务参数系数 x 类别head修正",
+        inputs: `${scale.paramsM}M x ${formatNumber(task.paramsMultiplier)} x ${formatNumber(headAdjustment)}`,
+        result: `${formatNumber(params / 1e6)}M params`
+      },
+      {
+        item: "模型权重",
+        formula: "参数量 x 精度字节数",
+        inputs: `${formatNumber(params / 1e6)}M params x ${precisionBytes} bytes (${config.precision})`,
+        result: formatGib(weightBytes)
+      },
+      {
+        item: "模型存储",
+        formula: "模型权重 x 部署文件系数",
+        inputs: `${formatBytes(weightBytes)} x 1.25`,
+        result: formatBytes(storageBytes)
+      },
+      {
+        item: "输入尺寸系数",
+        formula: "(输入尺寸 / 640)^2",
+        inputs: `(${config.imageSize} / 640)^2`,
+        result: formatNumber(sizeFactor)
+      },
+      {
         item: "YOLO FLOPs",
-        formula: "640基准GFLOPs x (输入尺寸/640)^2 x 任务系数",
-        inputs: `${scale.gflops640} GFLOPs, ${config.imageSize}px, ${task.label}`,
+        formula: "640基准GFLOPs x 输入尺寸系数 x 任务FLOPs系数 x 类别head修正",
+        inputs: `${scale.gflops640} x ${formatNumber(sizeFactor)} x ${formatNumber(task.flopsMultiplier)} x ${formatNumber(
+          headAdjustment
+        )}`,
         result: `${formatNumber(gflopsPerFrame)} GFLOPs/frame`
       },
       {
         item: "实时算力",
-        formula: "GFLOPs/frame x FPS x batch / 后端有效利用率",
+        level: "key",
+        formula: "GFLOPs/frame x 单路 FPS x batch / 后端有效利用率",
         inputs: `${formatNumber(gflopsPerFrame)} x ${config.targetFps} x ${config.batchSize} / ${formatNumber(
           backendEfficiency
         )}`,
-        result: `${formatNumber(requiredTops)} TOPS`
+        result: formatComputeTops(requiredTops)
+      },
+      {
+        item: "特征图峰值",
+        formula: "batch x image_size x image_size x 精度字节数 x 任务激活系数 x 任务FLOPs系数",
+        inputs: `${config.batchSize} x ${config.imageSize} x ${config.imageSize} x ${precisionBytes} x ${formatNumber(
+          task.activationFactor
+        )} x ${formatNumber(task.flopsMultiplier)}`,
+        result: formatGib(activationBytes)
+      },
+      {
+        item: "候选数",
+        formula: "classify: 1；detect/segment/pose/obb: (S/8)^2 + (S/16)^2 + (S/32)^2",
+        inputs:
+          config.task === "classify"
+            ? "1 classification output"
+            : `(${config.imageSize}/8)^2 + (${config.imageSize}/16)^2 + (${config.imageSize}/32)^2`,
+        result: `${candidateCount} candidates`
+      },
+      {
+        item: "输出字段数",
+        formula: "classify: 类别数；其他任务: 类别数 + 任务额外字段",
+        inputs: `${config.classes} classes + ${task.outputExtraValues} extra`,
+        result: `${outputValues} values`
       },
       {
         item: "候选框/输出",
-        formula: "多尺度候选数 x 输出字段 x 精度字节数",
-        inputs: `${candidateCount} candidates, ${outputValues} values, ${config.precision}`,
+        formula: "batch x 候选数 x 输出字段数 x 精度字节数",
+        inputs: `${config.batchSize} x ${candidateCount} x ${outputValues} x ${precisionBytes}`,
         result: formatBytes(outputBytes)
+      },
+      {
+        item: "后处理工作区",
+        level: "key",
+        formula: "classify: batch x 类别数 x 4；其他任务: batch x 候选数 x 输出字段数 x fp32字节数 x NMS系数",
+        inputs:
+          config.task === "classify"
+            ? `${config.batchSize} x ${outputValues} x 4`
+            : `${config.batchSize} x ${candidateCount} x ${outputValues} x 4 x 1.8`,
+        result: formatBytes(postprocessBytes)
+      },
+      {
+        item: "运行时余量",
+        formula: "max(256MB, 权重 x 0.18 + 特征图 x 0.45 + 输出tensor)",
+        inputs: `max(256MB, ${formatBytes(weightBytes)} x 0.18 + ${formatBytes(activationBytes)} x 0.45 + ${formatBytes(
+          outputBytes
+        )})`,
+        result: formatGib(runtimeBytes)
+      },
+      {
+        item: "总内存容量",
+        level: "key",
+        formula: "模型权重 + 特征图峰值 + 输出tensor + 后处理工作区 + 运行时余量",
+        inputs: `${formatGib(weightBytes)} + ${formatGib(activationBytes)} + ${formatGib(outputBytes)} + ${formatGib(
+          postprocessBytes
+        )} + ${formatGib(runtimeBytes)}`,
+        result: formatBytes(totalMemory)
+      },
+      {
+        item: "单 batch 带宽访问量",
+        formula: "权重 x 0.18 + 特征图 x 3.2 + 输出tensor x 2.4 + 后处理工作区 x 1.1",
+        inputs: `${formatBytes(weightBytes)} x 0.18 + ${formatBytes(activationBytes)} x 3.2 + ${formatBytes(
+          outputBytes
+        )} x 2.4 + ${formatBytes(postprocessBytes)} x 1.1`,
+        result: formatBytes(bandwidthPerBatchBytes)
+      },
+      {
+        item: "DDR/显存带宽",
+        level: "key",
+        formula: "单路 FPS x 单 batch 带宽访问量",
+        inputs: `${config.targetFps} x ${formatBytes(bandwidthPerBatchBytes)}`,
+        result: `${formatNumber(bandwidthBytes / GB)} GB/s`
       }
     ],
     assumptions: [
       "YOLO 目录使用 Ultralytics 当前主线模型规模，任务 head 通过系数调整。",
+      "YOLO 的特征图、输出和后处理工作区已包含 batch，带宽按单 batch 访问量 x 单路 FPS 估算。",
       "后处理单独估算，Detection/Segmentation/Pose/OBB 与 Classification 的工作区不同。",
       "自定义类别数主要影响 head、输出 tensor 和后处理，不重估完整 backbone。"
     ],

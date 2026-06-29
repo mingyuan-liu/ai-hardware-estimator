@@ -591,11 +591,14 @@ const modelCatalog: CatalogModel[] = [...repositoryCatalog, ...yoloCatalog];
 const initialCatalogModel = modelCatalog[0];
 
 const defaultWorkload: RepositoryWorkload = {
-  batchSize: 4,
-  promptTokens: 2048,
+  batchSize: 1,
+  benchmarkTokens: 128,
+  prefillTokensPerSecond: 56.43,
+  promptTokens: 128,
+  targetPrefillMs: 2268,
   contextTokens: 4096,
-  outputTokens: 512,
-  targetTokensPerSecond: 120,
+  outputTokens: 128,
+  targetTokensPerSecond: 11.61,
   audioStreams: 4,
   targetRtf: 0.5,
   sampleRate: 16000,
@@ -782,7 +785,7 @@ function App() {
           {kind !== "yolo" && (
             <section className="panel-section">
               <SectionHeader icon={<BarChart3 size={18} />} title="精度" />
-              <PrecisionControls precision={precision} setPrecision={setPrecision} />
+              <PrecisionControls kind={kind} precision={precision} setPrecision={setPrecision} />
             </section>
           )}
         </aside>
@@ -1020,38 +1023,96 @@ function RepositoryWorkloadControls({ kind, workload, setWorkload }: RepositoryW
   const update = (patch: Partial<RepositoryWorkload>) => setWorkload({ ...workload, ...patch });
 
   if (kind === "llm") {
+    const applyBenchmark = (patch: Partial<RepositoryWorkload>) => {
+      const next = { ...workload, ...patch };
+      const benchmarkTokens = Math.max(1, next.benchmarkTokens);
+      const pp = Math.max(0.01, next.prefillTokensPerSecond);
+      const promptTokens = benchmarkTokens;
+      const outputTokens = benchmarkTokens;
+      const contextTokens = Math.max(4096, promptTokens + outputTokens, next.contextTokens);
+      setWorkload({
+        ...next,
+        benchmarkTokens,
+        promptTokens,
+        outputTokens,
+        contextTokens,
+        targetPrefillMs: Math.round((benchmarkTokens / pp) * 1000)
+      });
+    };
+
     return (
-      <div className="form-grid">
-        <NumberField label="Batch" value={workload.batchSize} min={1} step={1} onChange={(batchSize) => update({ batchSize })} />
-        <NumberField
-          label="Prompt tokens"
-          value={workload.promptTokens}
-          min={1}
-          step={128}
-          onChange={(promptTokens) => update({ promptTokens })}
-        />
-        <NumberField
-          label="Context tokens"
-          value={workload.contextTokens}
-          min={1}
-          step={512}
-          onChange={(contextTokens) => update({ contextTokens })}
-        />
-        <NumberField
-          label="输出 tokens"
-          value={workload.outputTokens}
-          min={1}
-          step={128}
-          onChange={(outputTokens) => update({ outputTokens })}
-        />
-        <NumberField
-          label="目标吞吐"
-          suffix="tokens/s"
-          value={workload.targetTokensPerSecond}
-          min={1}
-          step={10}
-          onChange={(targetTokensPerSecond) => update({ targetTokensPerSecond })}
-        />
+      <div className="control-stack">
+        <div className="field-group">
+          <div className="field-group-title">Benchmark 简单模式</div>
+          <div className="form-grid">
+            <NumberField
+              label="Benchmark 长度"
+              suffix="tokens"
+              value={workload.benchmarkTokens}
+              min={1}
+              step={128}
+              onChange={(benchmarkTokens) => applyBenchmark({ benchmarkTokens })}
+            />
+            <NumberField
+              label="PP token/s"
+              value={workload.prefillTokensPerSecond}
+              min={0.01}
+              step={1}
+              onChange={(prefillTokensPerSecond) => applyBenchmark({ prefillTokensPerSecond })}
+            />
+            <NumberField
+              label="TG token/s"
+              value={workload.targetTokensPerSecond}
+              min={0.01}
+              step={1}
+              onChange={(targetTokensPerSecond) => applyBenchmark({ targetTokensPerSecond })}
+            />
+            <ReadOnlyField label="Prefill 时间" value={`${workload.targetPrefillMs} ms`} />
+          </div>
+        </div>
+        <details className="advanced-input">
+          <summary>高级：请求规模与上下文</summary>
+          <div className="control-stack">
+            <div className="form-grid">
+              <NumberField
+                label="Batch / 并发"
+                value={workload.batchSize}
+                min={1}
+                step={1}
+                onChange={(batchSize) => update({ batchSize })}
+              />
+              <NumberField
+                label="Prompt tokens"
+                value={workload.promptTokens}
+                min={1}
+                step={128}
+                onChange={(promptTokens) => update({ promptTokens })}
+              />
+              <NumberField
+                label="生成 tokens"
+                value={workload.outputTokens}
+                min={1}
+                step={128}
+                onChange={(outputTokens) => update({ outputTokens })}
+              />
+              <NumberField
+                label="最大 Context tokens"
+                value={workload.contextTokens}
+                min={1}
+                step={512}
+                onChange={(contextTokens) => update({ contextTokens })}
+              />
+              <NumberField
+                label="目标 Prefill 时间"
+                suffix="ms"
+                value={workload.targetPrefillMs}
+                min={10}
+                step={50}
+                onChange={(targetPrefillMs) => update({ targetPrefillMs })}
+              />
+            </div>
+          </div>
+        </details>
       </div>
     );
   }
@@ -1085,28 +1146,64 @@ function RepositoryWorkloadControls({ kind, workload, setWorkload }: RepositoryW
 }
 
 function PrecisionControls({
+  kind,
   precision,
   setPrecision
 }: {
+  kind: ModelKind;
   precision: PrecisionConfig;
   setPrecision: (precision: PrecisionConfig) => void;
 }) {
+  if (kind === "llm") {
+    return (
+      <div className="control-stack">
+        <div className="form-grid">
+          <SelectField
+            label="权重量化"
+            value={precision.weights}
+            options={precisionOptions}
+            onChange={(weights) => setPrecision({ ...precision, weights })}
+          />
+        </div>
+        <details className="advanced-input">
+          <summary>高级：运行精度</summary>
+          <div className="control-stack">
+            <div className="form-grid">
+              <SelectField
+                label="激活精度"
+                value={precision.activation}
+                options={precisionOptions}
+                onChange={(activation) => setPrecision({ ...precision, activation })}
+              />
+              <SelectField
+                label="KV Cache 精度"
+                value={precision.kvCache}
+                options={precisionOptions}
+                onChange={(kvCache) => setPrecision({ ...precision, kvCache })}
+              />
+            </div>
+          </div>
+        </details>
+      </div>
+    );
+  }
+
   return (
     <div className="form-grid">
       <SelectField
-        label="权重"
+        label="权重量化"
         value={precision.weights}
         options={precisionOptions}
         onChange={(weights) => setPrecision({ ...precision, weights })}
       />
       <SelectField
-        label="激活"
+        label="激活精度"
         value={precision.activation}
         options={precisionOptions}
         onChange={(activation) => setPrecision({ ...precision, activation })}
       />
       <SelectField
-        label="KV cache"
+        label="KV Cache 精度"
         value={precision.kvCache}
         options={precisionOptions}
         onChange={(kvCache) => setPrecision({ ...precision, kvCache })}
@@ -1123,7 +1220,7 @@ function YoloDeploymentControls({ yolo, setYolo }: { yolo: YoloConfig; setYolo: 
       <div className="form-grid">
         <NumberField label="输入尺寸" suffix="px" value={yolo.imageSize} min={160} step={32} onChange={(imageSize) => update({ imageSize })} />
         <NumberField label="Batch" value={yolo.batchSize} min={1} step={1} onChange={(batchSize) => update({ batchSize })} />
-        <NumberField label="目标 FPS" suffix="FPS" value={yolo.targetFps} min={1} step={5} onChange={(targetFps) => update({ targetFps })} />
+        <NumberField label="单路 FPS" suffix="FPS" value={yolo.targetFps} min={1} step={5} onChange={(targetFps) => update({ targetFps })} />
         <NumberField label="类别数" value={yolo.classes} min={1} step={1} onChange={(classes) => update({ classes })} />
         <SelectField label="精度" value={yolo.precision} options={precisionOptions} onChange={(value) => update({ precision: value })} />
         <SelectField
@@ -1167,6 +1264,15 @@ function NumberField({ label, value, min, step, suffix, onChange }: NumberFieldP
   );
 }
 
+function ReadOnlyField({ label, value }: { label: string; value: string }) {
+  return (
+    <label className="field">
+      <span>{label}</span>
+      <output className="readonly-field">{value}</output>
+    </label>
+  );
+}
+
 interface SelectFieldProps<T extends string> {
   label: string;
   value: T;
@@ -1205,6 +1311,33 @@ function ReportView({ report }: { report: RequirementReport }) {
       <MemoryBreakdown report={report} />
       <FormulaTable report={report} />
       <AssumptionList report={report} />
+      <UnitGuide />
+    </section>
+  );
+}
+
+function UnitGuide() {
+  return (
+    <section className="report-section compact-section">
+      <h3>单位速查</h3>
+      <div className="unit-grid">
+        <div>
+          <strong>GOp / TOp</strong>
+          <span>总操作量；1 GOp = 10 亿次，1 TOp = 1 万亿次 = 1000 GOp。</span>
+        </div>
+        <div>
+          <strong>GOPS / TOPS</strong>
+          <span>每秒操作量；1 GOPS = 每秒 10 亿次，1 TOPS = 每秒 1 万亿次。</span>
+        </div>
+        <div>
+          <strong>GB / GiB</strong>
+          <span>同一容量的十进制/二进制表示；1 GiB = 1.074 GB。</span>
+        </div>
+        <div>
+          <strong>GB/s</strong>
+          <span>每秒数据搬运量，用来看内存或显存带宽。</span>
+        </div>
+      </div>
     </section>
   );
 }
@@ -1270,32 +1403,48 @@ function MemoryBreakdown({ report }: { report: RequirementReport }) {
 }
 
 function FormulaTable({ report }: { report: RequirementReport }) {
+  const keyFormulas = report.formulas.filter((row) => row.level === "key");
+  const advancedFormulas = report.formulas.filter((row) => row.level !== "key");
+  const visibleKeyFormulas = keyFormulas.length ? keyFormulas : report.formulas;
+
   return (
     <section className="report-section">
-      <h3>公式明细</h3>
-      <div className="table-wrap">
-        <table>
-          <thead>
-            <tr>
-              <th>项目</th>
-              <th>公式</th>
-              <th>输入</th>
-              <th>结果</th>
-            </tr>
-          </thead>
-          <tbody>
-            {report.formulas.map((row) => (
-              <tr key={row.item}>
-                <td>{row.item}</td>
-                <td>{row.formula}</td>
-                <td>{row.inputs}</td>
-                <td className="strong">{row.result}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
+      <h3>关键公式</h3>
+      <FormulaRows rows={visibleKeyFormulas} />
+      {advancedFormulas.length > 0 && keyFormulas.length > 0 && (
+        <details className="formula-details">
+          <summary>高级公式 / 展开全部</summary>
+          <FormulaRows rows={advancedFormulas} />
+        </details>
+      )}
     </section>
+  );
+}
+
+function FormulaRows({ rows }: { rows: RequirementReport["formulas"] }) {
+  return (
+    <div className="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>项目</th>
+            <th>公式</th>
+            <th>输入</th>
+            <th>结果</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((row) => (
+            <tr key={row.item}>
+              <td>{row.item}</td>
+              <td>{row.formula}</td>
+              <td>{row.inputs}</td>
+              <td className="strong">{row.result}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
   );
 }
 

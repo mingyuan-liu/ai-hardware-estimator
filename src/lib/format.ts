@@ -14,6 +14,8 @@ export function formatBytes(bytes: number): string {
 
 export function formatGib(bytes: number): string {
   if (!Number.isFinite(bytes) || bytes <= 0) return "0 GiB";
+  if (bytes < 1024 ** 2) return `${formatNumber(bytes)} B`;
+  if (bytes < 1024 ** 3) return `${formatNumber(bytes / 1024 ** 2)} MiB`;
   return `${formatNumber(bytes / 1024 ** 3)} GiB`;
 }
 
@@ -25,10 +27,32 @@ export function formatNumber(value: number, maximumFractionDigits = 2): string {
   }).format(value);
 }
 
+export function formatComputeTops(value: number): string {
+  if (!Number.isFinite(value)) return "-";
+  const abs = Math.abs(value);
+  if (abs > 0 && abs < 0.01) return `${formatNumber(value * 1000)} GOPS`;
+  return `${formatNumber(value)} TOPS`;
+}
+
+export function formatComputeOps(ops: number): string {
+  if (!Number.isFinite(ops)) return "-";
+  const abs = Math.abs(ops);
+  if (abs >= 1e12) return `${formatNumber(ops / 1e12)} TOp`;
+  if (abs >= 1e9) return `${formatNumber(ops / 1e9)} GOp`;
+  if (abs >= 1e6) return `${formatNumber(ops / 1e6)} MOp`;
+  return `${formatNumber(ops)} Op`;
+}
+
 export function formatBand(value: number, unit: string): string {
-  if (unit === "GB" || unit === "GB/s") return `${formatNumber(value)} ${unit}`;
-  if (unit === "TOPS" || unit === "TFLOPs") return `${formatNumber(value)} ${unit}`;
+  if (unit === "GB") {
+    if (Math.abs(value) > 0 && Math.abs(value) < 0.01) return `${formatNumber(value * 1000)} MB`;
+    return `${formatNumber(value)} GB`;
+  }
+  if (unit === "GB/s") return `${formatNumber(value)} ${unit}`;
+  if (unit === "TOPS" || unit === "TFLOPs") return formatComputeTops(value);
+  if (unit === "Op") return formatComputeOps(value);
   if (unit === "MB") return `${formatNumber(value)} MB`;
+  if (unit === "ms") return `${formatNumber(value)} ms`;
   if (unit === "tokens/s" || unit === "FPS" || unit === "RTF") return `${formatNumber(value)} ${unit}`;
   return `${formatNumber(value)} ${unit}`;
 }
@@ -49,7 +73,12 @@ export function reportToMarkdown(report: RequirementReport): string {
         )} | ${formatBand(metric.value.conservative, metric.unit)} | ${metric.note || ""} |`
     )
     .join("\n");
-  const formulas = report.formulas
+  const keyFormulas = report.formulas.filter((row) => row.level === "key");
+  const advancedFormulas = keyFormulas.length ? report.formulas.filter((row) => row.level !== "key") : [];
+  const keyFormulaRows = (keyFormulas.length ? keyFormulas : report.formulas)
+    .map((row) => `| ${row.item} | ${row.formula} | ${row.inputs} | ${row.result} |`)
+    .join("\n");
+  const advancedFormulaRows = advancedFormulas
     .map((row) => `| ${row.item} | ${row.formula} | ${row.inputs} | ${row.result} |`)
     .join("\n");
   const assumptions = report.assumptions.map((item) => `- ${item}`).join("\n");
@@ -67,10 +96,12 @@ ${report.summary}
 |---|---:|---:|---:|---|
 ${metricRows}
 
-## 公式
+## 关键公式
 | 项目 | 公式 | 输入 | 结果 |
 |---|---|---|---|
-${formulas}
+${keyFormulaRows}
+
+${advancedFormulaRows ? `## 高级公式\n| 项目 | 公式 | 输入 | 结果 |\n|---|---|---|---|\n${advancedFormulaRows}\n` : ""}
 
 ## 假设
 ${assumptions}

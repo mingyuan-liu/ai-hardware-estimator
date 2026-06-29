@@ -32,7 +32,10 @@ export interface PrecisionConfig {
 
 export interface RepositoryWorkload {
   batchSize: number;
+  benchmarkTokens: number;
+  prefillTokensPerSecond: number;
   promptTokens: number;
+  targetPrefillMs: number;
   contextTokens: number;
   outputTokens: number;
   targetTokensPerSecond: number;
@@ -78,6 +81,7 @@ export interface FormulaRow {
   formula: string;
   inputs: string;
   result: string;
+  level?: "key" | "advanced";
 }
 
 export interface RequirementReport {
