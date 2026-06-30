@@ -214,6 +214,36 @@ HUGGINGFACE_BASE_URL=https://hf-mirror.com
 
 Nginx 通过 `/tools/ai-hardware-estimator/` 反向代理到本机 `8787` 端口。
 
+### 自动部署
+
+服务器使用独立 deploy service 从 GitHub 拉取并重建：
+
+```bash
+sudo cp deploy/systemd/ai-hardware-estimator-deploy.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl start ai-hardware-estimator-deploy.service
+```
+
+部署脚本：
+
+```text
+scripts/update_from_git.sh
+```
+
+默认配置：
+
+```text
+APP_DIR=/srv/ai-hardware-estimator
+APP_BRANCH=main
+APP_SERVICE=ai-hardware-estimator.service
+```
+
+GitHub webhook 复用主站的 `/deploy-hook`，由主站 webhook 服务按仓库名触发：
+
+```text
+mingyuan-liu/ai-hardware-estimator -> ai-hardware-estimator-deploy.service
+```
+
 ## 精度和校准说明
 
 本工具用于早期硬件规格评估和方案评审，不是周期级仿真器。

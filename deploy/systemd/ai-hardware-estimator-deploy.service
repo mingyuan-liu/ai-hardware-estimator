@@ -1,0 +1,11 @@
+[Unit]
+Description=Deploy AI Hardware Estimator from GitHub
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/ai-hardware-estimator-deploy.env
+ExecStart=/srv/ai-hardware-estimator/scripts/update_from_git.sh
+Nice=5
+IOSchedulingClass=best-effort
